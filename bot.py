@@ -6,6 +6,9 @@ import sqlite3
 import json
 import os
 import sys
+import re
+import threading
+from flask import Flask
 
 VK_GROUP_TOKEN = os.getenv('VK_GROUP_TOKEN')
 OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
@@ -131,150 +134,171 @@ def get_main_keyboard():
     keyboard.add_button('Помощь', color=VkKeyboardColor.NEGATIVE)
     return keyboard.get_keyboard()
 
+app = Flask(__name__)
 
-print("Бот запущен (только текст, без фото)...")
-active_tests = {}  # user_id: {stage, questions, current_q, score}
+@app.route('/')
+def home():
+    return "Bot is alive"
 
-for event in longpoll.listen():
-    if event.type != VkEventType.MESSAGE_NEW or not event.to_me or not event.from_user:
-        continue
+@app.route('/health')
+def health():
+    return "OK", 200
 
-    user_id = event.user_id
-    text = event.text.lower() if event.text else ""
+def run_flask():
+    # Берём порт из переменной окружения Render (по умолчанию 10000)
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port)
 
-    if text == "начать" or text == "привет":
-        vk.messages.send(
-            user_id=user_id,
-            message="Привет! Я ИИ-репетитор по физике. Выбери действие или задай любой вопрос по предмету.",
-            keyboard=get_main_keyboard(),
-            random_id=0
-        )
-        continue
+def run_bot():
+    print("Бот запущен (только текст, без фото)...")
+    active_tests = {}  # user_id: {stage, questions, current_q, score}
+    for event in longpoll.listen():
+        if event.type != VkEventType.MESSAGE_NEW or not event.to_me or not event.from_user:
+            continue
 
-    elif text == "помощь":
-        help_msg = (
-            "Я могу:\n"
-            "- объяснять теорию (кнопка «Теория»)\n"
-            "- решать задачи по тексту (кнопка «Решить задачу»)\n"
-            "- провести тест по выбранной теме (кнопка «Тест»)\n\n"
-            "Просто напиши свой вопрос или нажми кнопку.\n"
-            "Фото и документы пока не поддерживаются."
-        )
-        vk.messages.send(
-            user_id=user_id,
-            message=help_msg,
-            keyboard=get_main_keyboard(),
-            random_id=0
-        )
-        continue
+        user_id = event.user_id
+        text = event.text.lower() if event.text else ""
 
-    elif text == "теория":
-        vk.messages.send(
-            user_id=user_id,
-            message="Напиши тему, которую нужно объяснить (например, «закон Ома», «сила Архимеда»).",
-            random_id=0
-        )
-        continue
-
-    elif text == "решить задачу":
-        vk.messages.send(
-            user_id=user_id,
-            message="Пришли текст задачи, я решу её с подробными шагами. Фото пока не принимаю.",
-            random_id=0
-        )
-        continue
-
-    elif text == "тест":
-        vk.messages.send(
-            user_id=user_id,
-            message="Напиши тему для теста (например, «Кинематика»). Если хочешь по всем темам — напиши «Общий».",
-            random_id=0
-        )
-        active_tests[user_id] = {"stage": "choose_topic"}
-        continue
-
-    if event.attachments:
-        for att in event.attachments:
-            if att['type'] == 'photo':
-                vk.messages.send(
-                    user_id=user_id,
-                    message="Извини, я пока не умею обрабатывать фото. Пришли задачу текстом, и я решу!",
-                    keyboard=get_main_keyboard(),
-                    random_id=0
-                )
-                break
-        continue
-
-    if user_id in active_tests:
-        test_data = active_tests[user_id]
-        if test_data.get("stage") == "choose_topic":
-            topic = event.text
-            questions = generate_test(topic)
-            if not questions:
-                vk.messages.send(
-                    user_id=user_id,
-                    message="Не удалось создать тест. Попробуй другую тему.",
-                    keyboard=get_main_keyboard(),
-                    random_id=0
-                )
-                del active_tests[user_id]
-                continue
-            active_tests[user_id] = {
-                "stage": "asking",
-                "questions": questions,
-                "current_q": 0,
-                "score": 0,
-                "topic": topic
-            }
-            q = questions[0]
-            opts = "\n".join(q["options"])
+        if text == "начать" or text == "привет":
             vk.messages.send(
                 user_id=user_id,
-                message=f"Вопрос 1 из {len(questions)}:\n{q['question']}\n{opts}\n\nОтправь букву ответа (a, б, в, г).",
+                message="Привет! Я ИИ-репетитор по физике. Выбери действие или задай любой вопрос по предмету.",
+                keyboard=get_main_keyboard(),
                 random_id=0
             )
             continue
 
-        elif test_data.get("stage") == "asking":
-            user_answer = event.text.lower().strip()
-            q_index = test_data["current_q"]
-            questions = test_data["questions"]
-            correct_letter = questions[q_index]["answer"].lower()
-
-            mapping = {'а': 'a', 'б': 'b', 'в': 'c', 'г': 'd',
-                       'a': 'a', 'b': 'b', 'c': 'c', 'd': 'd'}
-            user_ans = mapping.get(user_answer, user_answer)
-            if user_ans == correct_letter:
-                test_data["score"] += 1
-                feedback = "✅ Верно!"
-            else:
-                feedback = f"❌ Неверно. Правильный ответ: {correct_letter}"
-
-            next_q = q_index + 1
-            if next_q < len(questions):
-                test_data["current_q"] = next_q
-                q = questions[next_q]
-                opts = "\n".join(q["options"])
-                msg = (f"{feedback}\n\nВопрос {next_q+1} из {len(questions)}:\n"
-                       f"{q['question']}\n{opts}\n\nТвой ответ (буква):")
-                vk.messages.send(user_id=user_id, message=msg, random_id=0)
-            else:
-                total = len(questions)
-                score = test_data["score"]
-                vk.messages.send(
-                    user_id=user_id,
-                    message=f"{feedback}\n\nТест завершён! Твой результат: {score} из {total}.",
-                    keyboard=get_main_keyboard(),
-                    random_id=0
-                )
-                del active_tests[user_id]
+        elif text == "помощь":
+            help_msg = (
+                "Я могу:\n"
+                "- объяснять теорию (кнопка «Теория»)\n"
+                "- решать задачи по тексту (кнопка «Решить задачу»)\n"
+                "- провести тест по выбранной теме (кнопка «Тест»)\n\n"
+                "Просто напиши свой вопрос или нажми кнопку.\n"
+                "Фото и документы пока не поддерживаются."
+            )
+            vk.messages.send(
+                user_id=user_id,
+                message=help_msg,
+                keyboard=get_main_keyboard(),
+                random_id=0
+            )
             continue
 
-    if text and not event.attachments:
-        answer = ask_ai(event.text, user_id)
-        vk.messages.send(
-            user_id=user_id,
-            message=answer,
-            keyboard=get_main_keyboard(),
-            random_id=0
-        )
+        elif text == "теория":
+            vk.messages.send(
+                user_id=user_id,
+                message="Напиши тему, которую нужно объяснить (например, «закон Ома», «сила Архимеда»).",
+                random_id=0
+            )
+            continue
+
+        elif text == "решить задачу":
+            vk.messages.send(
+                user_id=user_id,
+                message="Пришли текст задачи, я решу её с подробными шагами. Фото пока не принимаю.",
+                random_id=0
+            )
+            continue
+
+        elif text == "тест":
+            vk.messages.send(
+                user_id=user_id,
+                message="Напиши тему для теста (например, «Кинематика»). Если хочешь по всем темам — напиши «Общий».",
+                random_id=0
+            )
+            active_tests[user_id] = {"stage": "choose_topic"}
+            continue
+
+        if event.attachments:
+            for att in event.attachments:
+                if att['type'] == 'photo':
+                    vk.messages.send(
+                        user_id=user_id,
+                        message="Извини, я пока не умею обрабатывать фото. Пришли задачу текстом, и я решу!",
+                        keyboard=get_main_keyboard(),
+                        random_id=0
+                    )
+                    break
+            continue
+
+        if user_id in active_tests:
+            test_data = active_tests[user_id]
+            if test_data.get("stage") == "choose_topic":
+                topic = event.text
+                questions = generate_test(topic)
+                if not questions:
+                    vk.messages.send(
+                        user_id=user_id,
+                        message="Не удалось создать тест. Попробуй другую тему.",
+                        keyboard=get_main_keyboard(),
+                        random_id=0
+                    )
+                    del active_tests[user_id]
+                    continue
+                active_tests[user_id] = {
+                    "stage": "asking",
+                    "questions": questions,
+                    "current_q": 0,
+                    "score": 0,
+                    "topic": topic
+                }
+                q = questions[0]
+                opts = "\n".join(q["options"])
+                vk.messages.send(
+                    user_id=user_id,
+                    message=f"Вопрос 1 из {len(questions)}:\n{q['question']}\n{opts}\n\nОтправь букву ответа (a, б, в, г).",
+                    random_id=0
+                )
+                continue
+
+            elif test_data.get("stage") == "asking":
+                user_answer = event.text.lower().strip()
+                q_index = test_data["current_q"]
+                questions = test_data["questions"]
+                correct_letter = questions[q_index]["answer"].lower()
+
+                mapping = {'а': 'a', 'б': 'b', 'в': 'c', 'г': 'd',
+                           'a': 'a', 'b': 'b', 'c': 'c', 'd': 'd'}
+                user_ans = mapping.get(user_answer, user_answer)
+                if user_ans == correct_letter:
+                    test_data["score"] += 1
+                    feedback = "✅ Верно!"
+                else:
+                    feedback = f"❌ Неверно. Правильный ответ: {correct_letter}"
+
+                next_q = q_index + 1
+                if next_q < len(questions):
+                    test_data["current_q"] = next_q
+                    q = questions[next_q]
+                    opts = "\n".join(q["options"])
+                    msg = (f"{feedback}\n\nВопрос {next_q+1} из {len(questions)}:\n"
+                           f"{q['question']}\n{opts}\n\nТвой ответ (буква):")
+                    vk.messages.send(user_id=user_id, message=msg, random_id=0)
+                else:
+                    total = len(questions)
+                    score = test_data["score"]
+                    vk.messages.send(
+                        user_id=user_id,
+                        message=f"{feedback}\n\nТест завершён! Твой результат: {score} из {total}.",
+                        keyboard=get_main_keyboard(),
+                        random_id=0
+                    )
+                    del active_tests[user_id]
+                continue
+
+        if text and not event.attachments:
+            answer = ask_ai(event.text, user_id)
+            vk.messages.send(
+                user_id=user_id,
+                message=answer,
+                keyboard=get_main_keyboard(),
+                random_id=0
+            )
+
+if __name__ == '__main__':
+    flask_thread = threading.Thread(target=run_flask)
+    flask_thread.daemon = True
+    flask_thread.start()
+
+    run_bot()
