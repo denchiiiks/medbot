@@ -17,7 +17,7 @@ if not VK_GROUP_TOKEN or not OPENROUTER_API_KEY:
     print("ОШИБКА: Не заданы переменные окружения VK_GROUP_TOKEN и OPENROUTER_API_KEY!")
     sys.exit(1)
 
-MODEL_NAME = "openai/gpt-4o-mini"
+MODEL_NAME = "openrouter/free"
 APP_URL = "http://localhost"
 CONTEXT_LENGTH = 10
 
