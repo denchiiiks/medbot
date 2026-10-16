@@ -6,16 +6,20 @@ import sqlite3
 import json
 import os
 import sys
+sys.stdout.reconfigure(encoding='utf-8')
 import re
 import threading
 from flask import Flask
 
 VK_GROUP_TOKEN = os.getenv('VK_GROUP_TOKEN')
 OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
-MODEL_NAME = "openai/gpt-oss-120b:free"
+if not VK_GROUP_TOKEN or not OPENROUTER_API_KEY:
+    print("ОШИБКА: Не заданы переменные окружения VK_GROUP_TOKEN и OPENROUTER_API_KEY!")
+    sys.exit(1)
+
+MODEL_NAME = "openai/gpt-4o-mini"
 APP_URL = "http://localhost"
 CONTEXT_LENGTH = 10
-
 
 vk_session = vk_api.VkApi(token=VK_GROUP_TOKEN)
 vk = vk_session.get_api()
@@ -26,43 +30,54 @@ client = OpenAI(
     api_key=OPENROUTER_API_KEY,
     default_headers={
         "HTTP-Referer": APP_URL,
-        "X-Title": "PhysicsOGEBot"
+        "X-Title": "MedCheckBot"
     }
 )
 
-
 conn = sqlite3.connect('history.db', check_same_thread=False)
 cur = conn.cursor()
-cur.execute('''
-    CREATE TABLE IF NOT EXISTS messages (
-        user_id INTEGER,
-        role TEXT,
-        content TEXT,
-        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-''')
+cur.execute('''CREATE TABLE IF NOT EXISTS messages (
+    user_id INTEGER, role TEXT, content TEXT,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
 conn.commit()
-
 
 SYSTEM_PROMPT = {
     "role": "system",
-    "content": """Ты — дружелюбный репетитор по физике для подготовки к ОГЭ (9 класс).
-Отвечай только на вопросы по физике из программы 7–9 классов.
-Если вопрос не по физике, вежливо скажи, что помогаешь только с физикой, и предложи вернуться к предмету.
-Все ответы на русском языке. Объясняй формулы, законы, решай задачи.
-При решении задачи обязательно:
-- перепиши условие,
-- запиши «Дано», «СИ» (если нужно), «Найти»,
-- запиши формулы,
-- подставь числа,
-- получи ответ с единицами измерения.
-Используй простой язык, как для девятиклассника.
-При генерации тестов: дай 5 вопросов с 4 вариантами ответов, укажи правильный. Формат: JSON.
-Никогда не решай задачи не по физике, не пиши код, не отвечай на запросы не по теме.
-Не используй Markdown-разметку (звёздочки, решётки, обратные кавычки, символы подчёркивания). 
-Пиши обычным текстом, для выделения используй переносы строк и заглавные буквы."""
+    "content": """Ты — помощник по распознаванию псевдолечения и поиску надёжных медицинских советов.
+Твоя задача — анализировать утверждения о здоровье и медицине, которые присылает пользователь, и определять, есть ли признаки псевдонауки.
+
+Используй следующие критерии КРАСНЫХ ФЛАГОВ (признаки псевдолечения):
+1. «Секретные» или «универсальные» методики — обещание вылечить одним средством сразу много болезней.
+2. Отказ от официальной медицины — призывы бросить назначенное врачом лечение.
+3. Громкие и бездоказательные заявления — «100% гарантия», «панацея», «мгновенный эффект», «чудо-средство».
+4. Теории заговора — «фармкомпании скрывают», «врачи молчат».
+5. Опора только на отзывы и личные истории — «мне помогло», «бабушка вылечилась».
+6. Агрессивные продажи — подталкивание к покупке БАДа, курса, прибора по «акции».
+
+Признаки НАДЁЖНЫХ И АВТОРИТЕТНЫХ СОВЕТОВ:
+- Ссылки на авторитетные источники (ВОЗ, Минздрав, Cochrane, PubMed, рецензируемые журналы).
+- Взвешенный и сдержанный тон, упоминание побочных эффектов и ограничений.
+- Понятный статус автора (врач, профильный журналист с указанием квалификации).
+- Призыв обратиться к специалисту, напоминание, что информация носит ознакомительный характер.
+
+При анализе утверждения:
+1. Определи, есть ли красные флаги. Перечисли их.
+2. Определи, есть ли признаки надёжности. Перечисли их.
+3. Сделай вывод: утверждение выглядит как псевдонаучное, сомнительное или заслуживающее доверия.
+4. Если возможно, порекомендуй обратиться к официальным источникам: Cochrane (cochrane.org/ru/evidence), МедПортал (medportal.ru), Купрум (cuprum.media).
+5. Всегда напоминай, что ты не врач и не заменяешь консультацию специалиста.
+
+Отвечай на русском языке. Не используй Markdown-разметку. Пиши обычным текстом, для выделения используй переносы строк и заглавные буквы."""
 }
 
+def clean_markdown(text):
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+    text = re.sub(r'\*(.+?)\*', r'\1', text)
+    text = re.sub(r'__(.+?)__', r'\1', text)
+    text = re.sub(r'^#+\s*', '', text, flags=re.MULTILINE)
+    text = re.sub(r'`(.+?)`', r'\1', text)
+    text = text.replace('*', '')
+    return text
 
 def load_context(user_id):
     cur.execute(
@@ -72,6 +87,8 @@ def load_context(user_id):
     return [{"role": r[0], "content": r[1]} for r in cur.fetchall()]
 
 def save_message(user_id, role, content):
+    if len(content) > 2000:
+        content = content[:2000]
     cur.execute(
         "INSERT INTO messages (user_id, role, content) VALUES (?, ?, ?)",
         (user_id, role, content)
@@ -94,7 +111,7 @@ def ask_ai(prompt, user_id):
             temperature=0.3,
             max_tokens=1500
         )
-        answer = response.choices[0].message.content
+        answer = clean_markdown(response.choices[0].message.content)
         save_message(user_id, "user", prompt)
         save_message(user_id, "assistant", answer)
         return answer
@@ -102,11 +119,11 @@ def ask_ai(prompt, user_id):
         print(f"OpenRouter error: {e}")
         return "Извини, произошла техническая ошибка. Попробуй позже."
 
-def generate_test(topic=None):
+def generate_test():
     prompt = (
-        f"Сгенерируй тест из 5 вопросов по физике (ОГЭ) на тему '{topic}' "
-        "с 4 вариантами ответов и укажи правильный. Верни строго JSON массив "
-        "объектов с ключами: question, options (список), answer (буква варианта)."
+        "Сгенерируй тест из 5 вопросов на тему медицинских мифов и псевдолечения. "
+        "Каждый вопрос с 4 вариантами ответов и укажи правильный. "
+        "Верни строго JSON массив объектов с ключами: question, options (список), answer (буква варианта)."
     )
     try:
         response = client.chat.completions.create(
@@ -119,39 +136,73 @@ def generate_test(topic=None):
         end = raw.rfind(']') + 1
         if start != -1 and end != 0:
             return json.loads(raw[start:end])
-        else:
-            return []
+        return []
     except Exception as e:
         print(f"Test generation error: {e}")
         return []
 
 def get_main_keyboard():
     keyboard = VkKeyboard(one_time=False)
-    keyboard.add_button('Теория', color=VkKeyboardColor.PRIMARY)
-    keyboard.add_button('Решить задачу', color=VkKeyboardColor.POSITIVE)
+    keyboard.add_button('Проверить утверждение', color=VkKeyboardColor.PRIMARY)
+    keyboard.add_button('Красные флаги', color=VkKeyboardColor.NEGATIVE)
     keyboard.add_line()
-    keyboard.add_button('Тест', color=VkKeyboardColor.SECONDARY)
-    keyboard.add_button('Помощь', color=VkKeyboardColor.NEGATIVE)
+    keyboard.add_button('Надёжные источники', color=VkKeyboardColor.POSITIVE)
+    keyboard.add_button('Проверь себя', color=VkKeyboardColor.SECONDARY)
+    keyboard.add_line()
+    keyboard.add_button('Помощь', color=VkKeyboardColor.SECONDARY)
     return keyboard.get_keyboard()
+
+def get_sources_text():
+    return (
+        "Надёжные источники по доказательной медицине:\n\n"
+        "1. Cochrane (Кокрейновские обзоры) — https://www.cochrane.org/ru/evidence\n"
+        "   Собирает все исследования по теме, отсеивает мусорные и делает строгий вывод.\n\n"
+        "2. МедПортал — https://medportal.ru/\n"
+        "   Один из старейших медицинских сайтов Рунета. Разбирает мифы и фейки на основе доказательного подхода.\n\n"
+        "3. Журнал «Купрум» — https://cuprum.media/\n"
+        "   Современное медиа о здоровье. Коротко и понятно разбирает медицинские фейки и тренды из TikTok.\n\n"
+        "Помни: я не врач. При серьёзных symptoms обращайся к специалисту."
+    )
+
+def get_red_flags_text():
+    return (
+        "КРАСНЫЕ ФЛАГИ — признаки псевдолечения:\n\n"
+        "1. «Секретные» или «универсальные» методики — обещают вылечить одним средством сразу много болезней.\n"
+        "2. Отказ от официальной медицины — призывы бросить назначенное врачом лечение.\n"
+        "3. Громкие заявления — «100% гарантия», «панацея», «мгновенный эффект», «чудо-средство».\n"
+        "4. Теории заговора — «фармкомпании скрывают», «врачи молчат».\n"
+        "5. Опора только на отзывы — «мне помогло», «бабушка вылечилась».\n"
+        "6. Агрессивные продажи — подталкивание к покупке БАДа, курса, прибора по «акции».\n\n"
+        "Если видишь хотя бы один из этих признаков — относись к информации с крайним скептицизмом."
+    )
+
+def get_checklist_text():
+    return (
+        "ЧЕК-ЛИСТ: задайте себе 4 вопроса, столкнувшись с медицинским советом в интернете:\n\n"
+        "1. Кто это говорит? Есть ли у автора высшее медицинское образование и действующая практика?\n"
+        "2. Чем это подтверждается? Есть ли ссылки на крупные исследования или всё строится на личных рассуждениях?\n"
+        "3. Что мне пытаются продать? Это текст с бескорыстным просвещением или скрытая реклама?\n"
+        "4. Совпадает ли это с мнением официальной науки? Если метод уникален и о нём пишет только один сайт — скорее всего, это обман."
+    )
 
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot is alive"
+    return "MedBot is alive"
 
 @app.route('/health')
 def health():
     return "OK", 200
 
 def run_flask():
-    # Берём порт из переменной окружения Render (по умолчанию 10000)
     port = int(os.environ.get('PORT', 10000))
     app.run(host='0.0.0.0', port=port)
 
 def run_bot():
-    print("Бот запущен (только текст, без фото)...")
-    active_tests = {}  # user_id: {stage, questions, current_q, score}
+    print("Медицинский бот запущен...")
+    active_tests = {}
+
     for event in longpoll.listen():
         if event.type != VkEventType.MESSAGE_NEW or not event.to_me or not event.from_user:
             continue
@@ -159,107 +210,68 @@ def run_bot():
         user_id = event.user_id
         text = event.text.lower() if event.text else ""
 
-        if text == "начать" or text == "привет":
+        if text in ("начать", "привет"):
             vk.messages.send(
                 user_id=user_id,
-                message="Привет! Я ИИ-репетитор по физике. Выбери действие или задай любой вопрос по предмету.",
+                message="Привет! Я помогу распознать псевдолечение и найти надёжные медицинские советы. "
+                        "Пришли утверждение, и я проверю его на красные флаги. Или выбери действие на клавиатуре.",
                 keyboard=get_main_keyboard(),
                 random_id=0
             )
             continue
 
-        elif text == "помощь":
+        if text == "помощь":
             help_msg = (
-                "Я могу:\n"
-                "- объяснять теорию (кнопка «Теория»)\n"
-                "- решать задачи по тексту (кнопка «Решить задачу»)\n"
-                "- провести тест по выбранной теме (кнопка «Тест»)\n\n"
-                "Просто напиши свой вопрос или нажми кнопку.\n"
-                "Фото и документы пока не поддерживаются."
+                "Я умею:\n"
+                "- Проверять утверждения о здоровье на признаки псевдонауки (просто напиши утверждение)\n"
+                "- Показывать красные флаги псевдолечения (кнопка «Красные флаги»)\n"
+                "- Давать ссылки на надёжные источники (кнопка «Надёжные источники»)\n"
+                "- Проводить тест на знание медицинских мифов (кнопка «Проверь себя»)\n\n"
+                "Фото и документы пока не поддерживаются. Пришли текст."
             )
-            vk.messages.send(
-                user_id=user_id,
-                message=help_msg,
-                keyboard=get_main_keyboard(),
-                random_id=0
-            )
+            vk.messages.send(user_id=user_id, message=help_msg, keyboard=get_main_keyboard(), random_id=0)
             continue
 
-        elif text == "теория":
-            vk.messages.send(
-                user_id=user_id,
-                message="Напиши тему, которую нужно объяснить (например, «закон Ома», «сила Архимеда»).",
-                random_id=0
-            )
+        if text == "красные флаги":
+            vk.messages.send(user_id=user_id, message=get_red_flags_text(), keyboard=get_main_keyboard(), random_id=0)
             continue
 
-        elif text == "решить задачу":
-            vk.messages.send(
-                user_id=user_id,
-                message="Пришли текст задачи, я решу её с подробными шагами. Фото пока не принимаю.",
-                random_id=0
-            )
+        if text == "надёжные источники":
+            vk.messages.send(user_id=user_id, message=get_sources_text(), keyboard=get_main_keyboard(), random_id=0)
             continue
 
-        elif text == "тест":
-            vk.messages.send(
-                user_id=user_id,
-                message="Напиши тему для теста (например, «Кинематика»). Если хочешь по всем темам — напиши «Общий».",
-                random_id=0
-            )
-            active_tests[user_id] = {"stage": "choose_topic"}
+        if text == "проверить утверждение":
+            vk.messages.send(user_id=user_id,
+                             message="Напиши утверждение о здоровье, которое хочешь проверить. Например: «Этот БАД вылечит простуду за один день».",
+                             random_id=0)
             continue
 
-        if event.attachments:
-            for att in event.attachments:
-                if att['type'] == 'photo':
-                    vk.messages.send(
-                        user_id=user_id,
-                        message="Извини, я пока не умею обрабатывать фото. Пришли задачу текстом, и я решу!",
-                        keyboard=get_main_keyboard(),
-                        random_id=0
-                    )
-                    break
+        if text == "проверь себя":
+            questions = generate_test()
+            if not questions:
+                vk.messages.send(user_id=user_id, message="Не удалось создать тест. Попробуй позже.", keyboard=get_main_keyboard(), random_id=0)
+                continue
+            active_tests[user_id] = {
+                "stage": "asking",
+                "questions": questions,
+                "current_q": 0,
+                "score": 0
+            }
+            q = questions[0]
+            opts = "\n".join(q["options"])
+            vk.messages.send(user_id=user_id,
+                             message=f"Вопрос 1 из {len(questions)}:\n{q['question']}\n{opts}\n\nОтправь букву ответа (a, б, в, г).",
+                             random_id=0)
             continue
 
         if user_id in active_tests:
             test_data = active_tests[user_id]
-            if test_data.get("stage") == "choose_topic":
-                topic = event.text
-                questions = generate_test(topic)
-                if not questions:
-                    vk.messages.send(
-                        user_id=user_id,
-                        message="Не удалось создать тест. Попробуй другую тему.",
-                        keyboard=get_main_keyboard(),
-                        random_id=0
-                    )
-                    del active_tests[user_id]
-                    continue
-                active_tests[user_id] = {
-                    "stage": "asking",
-                    "questions": questions,
-                    "current_q": 0,
-                    "score": 0,
-                    "topic": topic
-                }
-                q = questions[0]
-                opts = "\n".join(q["options"])
-                vk.messages.send(
-                    user_id=user_id,
-                    message=f"Вопрос 1 из {len(questions)}:\n{q['question']}\n{opts}\n\nОтправь букву ответа (a, б, в, г).",
-                    random_id=0
-                )
-                continue
-
-            elif test_data.get("stage") == "asking":
+            if test_data.get("stage") == "asking":
                 user_answer = event.text.lower().strip()
                 q_index = test_data["current_q"]
                 questions = test_data["questions"]
                 correct_letter = questions[q_index]["answer"].lower()
-
-                mapping = {'а': 'a', 'б': 'b', 'в': 'c', 'г': 'd',
-                           'a': 'a', 'b': 'b', 'c': 'c', 'd': 'd'}
+                mapping = {'а': 'a', 'б': 'b', 'в': 'c', 'г': 'd', 'a': 'a', 'b': 'b', 'c': 'c', 'd': 'd'}
                 user_ans = mapping.get(user_answer, user_answer)
                 if user_ans == correct_letter:
                     test_data["score"] += 1
@@ -272,33 +284,33 @@ def run_bot():
                     test_data["current_q"] = next_q
                     q = questions[next_q]
                     opts = "\n".join(q["options"])
-                    msg = (f"{feedback}\n\nВопрос {next_q+1} из {len(questions)}:\n"
-                           f"{q['question']}\n{opts}\n\nТвой ответ (буква):")
+                    msg = f"{feedback}\n\nВопрос {next_q+1} из {len(questions)}:\n{q['question']}\n{opts}\n\nТвой ответ (буква):"
                     vk.messages.send(user_id=user_id, message=msg, random_id=0)
                 else:
                     total = len(questions)
                     score = test_data["score"]
-                    vk.messages.send(
-                        user_id=user_id,
-                        message=f"{feedback}\n\nТест завершён! Твой результат: {score} из {total}.",
-                        keyboard=get_main_keyboard(),
-                        random_id=0
-                    )
+                    vk.messages.send(user_id=user_id,
+                                     message=f"{feedback}\n\nТест завершён! Твой результат: {score} из {total}.",
+                                     keyboard=get_main_keyboard(),
+                                     random_id=0)
                     del active_tests[user_id]
                 continue
 
-        if text and not event.attachments:
-            answer = ask_ai(event.text, user_id)
-            vk.messages.send(
-                user_id=user_id,
-                message=answer,
-                keyboard=get_main_keyboard(),
-                random_id=0
-            )
+        if event.attachments:
+            vk.messages.send(user_id=user_id,
+                             message="Извини, я пока не умею обрабатывать фото. Пришли утверждение текстом.",
+                             keyboard=get_main_keyboard(),
+                             random_id=0)
+            continue
+
+        if text:
+            answer = ask_ai("Проанализируй утверждение: " + event.text, user_id)
+            vk.messages.send(user_id=user_id, message=answer, keyboard=get_main_keyboard(), random_id=0)
+            continue
+
 
 if __name__ == '__main__':
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
-
     run_bot()
